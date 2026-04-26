@@ -27,7 +27,7 @@ COLECCION_PRINCIPAL = "motores"
 
 # Intervalo mínimo entre subidas a Firebase (segundos)
 # El topic puede publicar muy rápido; esto evita saturar Firestore
-INTERVALO_SUBIDA_SEG = 5.0
+INTERVALO_SUBIDA_SEG = 0.5
 
 
 # ============================================================

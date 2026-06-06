@@ -28,6 +28,10 @@ setup(
             'esp32_node = package1.esp32_serial_node:main',
             'trajectory_sender = package1.trajectory_sender_node:main',
             'firebase_node = package1.firebase_node:main',
+            'camera_node = package1.camera_node:main',
+            'classifier_node = package1.classifier_node:main',
+            'sensors_node = package1.esp32_sensors_node:main',
+            'data_logger_node = package1.data_logger_node:main',
         ],
     },
 )

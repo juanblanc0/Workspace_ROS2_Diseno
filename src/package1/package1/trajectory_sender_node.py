@@ -24,14 +24,9 @@ Cada trayectoria tiene 51 iteraciones. Las velocidades se envían cada 20ms.
 Control cinemático diferencial:
   q_p_cmd = q_p_feedforward + Kp * (q_des - q_real)
 
-  donde:
-    q_des  = posición deseada en la iteración actual (del CSV T{n}.csv)
-    q_real = posición real de las articulaciones (del topic esp32/state, JointState)
-    q_p_ff = velocidad feedforward (del CSV T{n}_p.csv)
-    Kp     = ganancia proporcional (ajustable en KP)
-
-  Si no ha llegado ningún mensaje de feedback aún, se opera en lazo abierto
-  publicando únicamente el feedforward.
+Control idle (sin trayectoria activa):
+  q_p_cmd = KP_IDLE * (0.0 - q_real)
+  setpoint publicado: (0.0, 0.0)
 """
 
 import rclpy
@@ -58,18 +53,12 @@ TRAJECTORY_SETS = {
 }
 
 TRAJ_DIR           = '/home/camilo/trayectorias'
-PUBLISH_INTERVAL_S = 0.02   # 20 ms entre iteraciones
-TOTAL_ITERATIONS   = 51     # Iteraciones esperadas por trayectoria
-
-# Ganancia proporcional del controlador cinemático.
-# Unidades: (rad/s) / rad  →  1/s
-# Aumentar si la corrección es lenta; bajar si hay oscilaciones.
-KP = 5.0
-
-# Topic donde el nodo ESP32 publica el estado real de las articulaciones.
-# Tipo: sensor_msgs/JointState
-# position[0] = q1_real (rad)   position[1] = q2_real (rad)
-FEEDBACK_TOPIC = 'esp32/state'
+PUBLISH_INTERVAL_S = 0.02
+TOTAL_ITERATIONS   = 51
+KP                 = 5.0
+KP_IDLE            = 5.0
+KP_MAX_CORRECTION  = 1.5
+FEEDBACK_TOPIC     = 'esp32/state'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -77,14 +66,6 @@ FEEDBACK_TOPIC = 'esp32/state'
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TrajectorySenderNode(Node):
-    """
-    Nodo que recibe un número de set (1/2/3) por topic y publica
-    las velocidades corregidas de cada trayectoria hacia esp32/cmd_vel.
-
-    Ley de control por iteración:
-        e_q      = q_des - q_real          (error articular)
-        q_p_cmd  = q_p_ff + Kp * e_q      (feedforward + corrección)
-    """
 
     def __init__(self):
         super().__init__('trajectory_sender_node')
@@ -100,14 +81,6 @@ class TrajectorySenderNode(Node):
         )
 
         # ── Subscriber: estado real de articulaciones desde la ESP32 ──────────
-        # El nodo esp32_serial_node publica en 'esp32/state' un JointState con:
-        #   name       = ['motor1', 'motor2']
-        #   position   = [p1, p2]   ← q1_real, q2_real en radianes
-        #   velocity   = [v1, v2]   ← velocidades reales (no usadas en control)
-        #
-        # Se protege con Lock porque el callback de ROS2 (ejecutado por el
-        # executor en el hilo principal) y el hilo de ejecución de trayectorias
-        # acceden a _q_real de forma concurrente.
         self._feedback_lock     = threading.Lock()
         self._q_real: tuple[float, float] | None = None
         self._feedback_received = False
@@ -126,49 +99,108 @@ class TrajectorySenderNode(Node):
             qos
         )
 
-        # ── Estado de ejecución de trayectorias ───────────────────────────────
+        # ── Publisher: setpoint de posición deseada (MODIFICACIÓN MÍNIMA) ─────
+        # Publica (q1_des, q2_des, 0) en cada iteración de trayectoria.
+        # En idle publica (0, 0, 0).
+        # Lo consume data_logger_node para graficar real vs deseado.
+        self.setpoint_pub = self.create_publisher(
+            Vector3,
+            '/traj_setpoint',
+            qos
+        )
+
+        # ── Estado de ejecución ───────────────────────────────────────────────
         self._running     = False
         self._stop_event  = threading.Event()
         self._exec_thread: threading.Thread | None = None
 
+        # ── Timer de control idle ─────────────────────────────────────────────
+        self._idle_timer = self.create_timer(
+            PUBLISH_INTERVAL_S,
+            self._idle_control_callback
+        )
+
         self.get_logger().info(
             'TrajectorySenderNode iniciado.\n'
-            f'  Feedback topic : {FEEDBACK_TOPIC}  (sensor_msgs/JointState)\n'
-            f'  Kp             : {KP}\n'
-            f'  Intervalo      : {PUBLISH_INTERVAL_S * 1000:.0f} ms\n'
+            f'  Feedback topic    : {FEEDBACK_TOPIC}  (sensor_msgs/JointState)\n'
+            f'  Kp (trayectoria)  : {KP}\n'
+            f'  Kp (idle)         : {KP_IDLE}\n'
+            f'  KP_MAX_CORRECTION : {KP_MAX_CORRECTION} rad/s\n'
+            f'  Intervalo         : {PUBLISH_INTERVAL_S * 1000:.0f} ms\n'
             'Publica en /trajectory_set (Int32) el número de set (1, 2 o 3).'
         )
 
     # =========================================================================
-    # CALLBACK: estado real desde la ESP32  (esp32/state → JointState)
+    # IDLE CONTROL
+    # =========================================================================
+    def _idle_control_callback(self):
+        if self._running:
+            return
+
+        q_real = self._get_q_real()
+
+        # Setpoint de posición en idle siempre es (0, 0)
+        sp_msg = Vector3()
+        sp_msg.x = 0.0
+        sp_msg.y = 0.0
+        sp_msg.z = 0.0
+        self.setpoint_pub.publish(sp_msg)
+
+        msg = Vector3()
+
+        if q_real is not None:
+            q1_real, q2_real = q_real
+            e_q1  = 0.0 - q1_real
+            e_q2  = 0.0 - q2_real
+            corr1 = max(-KP_MAX_CORRECTION, min(KP_MAX_CORRECTION, KP_IDLE * e_q1))
+            corr2 = max(-KP_MAX_CORRECTION, min(KP_MAX_CORRECTION, KP_IDLE * e_q2))
+            msg.x = corr1
+            msg.y = corr2
+            msg.z = 0.0
+            self.get_logger().debug(
+                f'[IDLE] real=({q1_real:.4f}, {q2_real:.4f}) | '
+                f'err=({e_q1:.4f}, {e_q2:.4f}) | '
+                f'cmd=({corr1:.4f}, {corr2:.4f})'
+            )
+        else:
+            msg.x = 0.0
+            msg.y = 0.0
+            msg.z = 0.0
+            self.get_logger().debug('[IDLE] Sin feedback aún. Publicando (0, 0, 0).')
+
+        self.cmd_pub.publish(msg)
+
+    # =========================================================================
+    # HELPER: stop
+    # =========================================================================
+    def _publish_stop(self):
+        stop_msg = Vector3()
+        stop_msg.x = 0.0
+        stop_msg.y = 0.0
+        stop_msg.z = 0.0
+        self.cmd_pub.publish(stop_msg)
+        self.get_logger().info('⏹  cmd_vel (0, 0, 0) publicado → robot detenido.')
+
+    # =========================================================================
+    # CALLBACK: feedback de la ESP32
     # =========================================================================
     def _feedback_callback(self, msg: JointState):
-        """
-        Actualiza la posición real de las articulaciones.
-
-        El nodo esp32_serial_node llena el JointState así:
-            msg.position = [p1, p2]    donde p1=q1_real, p2=q2_real
-
-        Se valida que el mensaje tenga al menos 2 posiciones antes de usarlo.
-        """
         if len(msg.position) < 2:
             self.get_logger().warn(
                 f'JointState recibido con menos de 2 posiciones '
                 f'({len(msg.position)}). Ignorando.'
             )
             return
-
         with self._feedback_lock:
             self._q_real = (msg.position[0], msg.position[1])
             self._feedback_received = True
 
     def _get_q_real(self) -> tuple[float, float] | None:
-        """Devuelve la última posición real recibida de forma thread-safe."""
         with self._feedback_lock:
             return self._q_real
 
     # =========================================================================
-    # CALLBACK: número de set recibido  (/trajectory_set → Int32)
+    # CALLBACK: número de set
     # =========================================================================
     def set_callback(self, msg: Int32):
         set_id = msg.data
@@ -178,7 +210,6 @@ class TrajectorySenderNode(Node):
                 f'Set "{set_id}" no válido. Usa 1, 2 o 3.')
             return
 
-        # Si ya hay un set en ejecución, interrumpirlo limpiamente
         if self._running:
             self.get_logger().warn(
                 f'Interrumpiendo set en curso para iniciar Set {set_id}.')
@@ -186,7 +217,6 @@ class TrajectorySenderNode(Node):
             if self._exec_thread is not None:
                 self._exec_thread.join(timeout=2.0)
 
-        # Lanzar nuevo hilo de ejecución
         self._stop_event.clear()
         self._running = True
         self._exec_thread = threading.Thread(
@@ -197,7 +227,7 @@ class TrajectorySenderNode(Node):
         self._exec_thread.start()
 
     # =========================================================================
-    # EJECUCIÓN DEL SET (corre en hilo separado para no bloquear el executor)
+    # EJECUCIÓN DEL SET
     # =========================================================================
     def _run_set(self, set_id: int):
         traj_indices = TRAJECTORY_SETS[set_id]
@@ -206,33 +236,35 @@ class TrajectorySenderNode(Node):
             f'Trayectorias: {["T" + str(i) for i in traj_indices]}'
         )
 
+        set_aborted = False
+
         for traj_idx in traj_indices:
             if self._stop_event.is_set():
                 self.get_logger().warn('Set interrumpido antes de completarse.')
+                set_aborted = True
                 break
 
-            # ── Rutas de los archivos CSV ──────────────────────────────────────
-            pos_file = os.path.join(TRAJ_DIR, f'T{traj_idx}.csv')    # posiciones
-            vel_file = os.path.join(TRAJ_DIR, f'T{traj_idx}_p.csv')  # velocidades
+            pos_file = os.path.join(TRAJ_DIR, f'T{traj_idx}.csv')
+            vel_file = os.path.join(TRAJ_DIR, f'T{traj_idx}_p.csv')
 
-            # ── Cargar ambos CSVs antes de empezar ────────────────────────────
             try:
                 positions  = self._load_positions(pos_file)
                 velocities = self._load_velocities(vel_file)
             except FileNotFoundError as e:
-                self.get_logger().error(
-                    f'Archivo no encontrado: {e}. Abortando set.')
+                self.get_logger().error(f'Archivo no encontrado: {e}. Abortando set.')
+                set_aborted = True
                 break
             except ValueError as e:
                 self.get_logger().error(
                     f'Error de formato en archivos de T{traj_idx}: {e}. Abortando set.')
+                set_aborted = True
                 break
             except Exception as e:
                 self.get_logger().error(
                     f'Error inesperado cargando T{traj_idx}: {e}. Abortando set.')
+                set_aborted = True
                 break
 
-            # ── Advertir si el número de filas no es el esperado ──────────────
             if len(positions) != TOTAL_ITERATIONS:
                 self.get_logger().warn(
                     f'T{traj_idx}.csv tiene {len(positions)} filas '
@@ -242,7 +274,6 @@ class TrajectorySenderNode(Node):
                     f'T{traj_idx}_p.csv tiene {len(velocities)} filas '
                     f'(se esperaban {TOTAL_ITERATIONS}).')
 
-            # Usar el mínimo para no salirse de índice si los CSV tienen distinto largo
             n_iters = min(len(positions), len(velocities))
 
             self.get_logger().info(
@@ -250,145 +281,115 @@ class TrajectorySenderNode(Node):
                 f'({n_iters} iteraciones × {PUBLISH_INTERVAL_S * 1000:.0f} ms)'
             )
 
-            # ── Advertir si aún no hay feedback de la ESP32 ───────────────────
             if not self._feedback_received:
                 self.get_logger().warn(
                     f'Aún no se ha recibido feedback de "{FEEDBACK_TOPIC}". '
                     'Ejecutando en lazo abierto (solo feedforward) hasta que llegue.'
                 )
 
-            # ── Bucle de control: una iteración cada 20 ms ────────────────────
+            traj_interrupted = False
+
             for i in range(n_iters):
                 if self._stop_event.is_set():
                     self.get_logger().warn(
                         f'T{traj_idx} interrumpida en iteración {i + 1}.')
+                    traj_interrupted = True
                     break
 
-                # Referencia de esta iteración
-                q1_des,  q2_des   = positions[i]
-                q1_p_ff, q2_p_ff  = velocities[i]
+                q1_des,  q2_des  = positions[i]
+                q1_p_ff, q2_p_ff = velocities[i]
 
-                # Posición real (puede ser None si aún no llega feedback)
+                # ── Publicar setpoint de posición deseada ─────────────────────
+                # Es la única modificación dentro del bucle de control.
+                sp_msg = Vector3()
+                sp_msg.x = q1_des
+                sp_msg.y = q2_des
+                sp_msg.z = 0.0
+                self.setpoint_pub.publish(sp_msg)
+
                 q_real = self._get_q_real()
 
                 if q_real is not None:
                     q1_real, q2_real = q_real
-
-                    # ── Ley de control cinemático diferencial ─────────────────
-                    # Error articular (espacio de configuración)
-                    e_q1 = q1_des - q1_real
-                    e_q2 = q2_des - q2_real
-
-                    # Velocidad comandada = feedforward + corrección proporcional
-                    # El Jacobiano en espacio articular es la identidad (J = I),
-                    # por lo que la corrección diferencial se reduce a Kp * e_q.
-                    q1_p_cmd = q1_p_ff + KP * e_q1
-                    q2_p_cmd = q2_p_ff + KP * e_q2
-
+                    e_q1  = q1_des - q1_real
+                    e_q2  = q2_des - q2_real
+                    corr1 = max(-KP_MAX_CORRECTION, min(KP_MAX_CORRECTION, KP * e_q1))
+                    corr2 = max(-KP_MAX_CORRECTION, min(KP_MAX_CORRECTION, KP * e_q2))
+                    q1_p_cmd = q1_p_ff + corr1
+                    q2_p_cmd = q2_p_ff + corr2
                     self.get_logger().debug(
                         f'T{traj_idx} | iter {i + 1:02d} | '
                         f'des=({q1_des:.4f}, {q2_des:.4f}) | '
                         f'real=({q1_real:.4f}, {q2_real:.4f}) | '
                         f'err=({e_q1:.4f}, {e_q2:.4f}) | '
+                        f'corr=({corr1:.4f}, {corr2:.4f}) | '
                         f'cmd=({q1_p_cmd:.4f}, {q2_p_cmd:.4f})'
                     )
-
                 else:
-                    # ── Lazo abierto: sin feedback disponible ─────────────────
                     q1_p_cmd = q1_p_ff
                     q2_p_cmd = q2_p_ff
-
                     self.get_logger().debug(
                         f'T{traj_idx} | iter {i + 1:02d} | '
-                        f'[lazo abierto] '
-                        f'cmd=({q1_p_cmd:.4f}, {q2_p_cmd:.4f})'
+                        f'[lazo abierto] cmd=({q1_p_cmd:.4f}, {q2_p_cmd:.4f})'
                     )
 
-                # ── Publicar velocidad corregida → esp32/cmd_vel ───────────────
                 vec_msg = Vector3()
                 vec_msg.x = q1_p_cmd
                 vec_msg.y = q2_p_cmd
                 vec_msg.z = 0.0
                 self.cmd_pub.publish(vec_msg)
 
-                # Esperar 20 ms; sale antes si _stop_event se activa
                 interrupted = self._stop_event.wait(timeout=PUBLISH_INTERVAL_S)
                 if interrupted:
+                    traj_interrupted = True
                     break
 
+            self._publish_stop()
+
+            if traj_interrupted:
+                set_aborted = True
+                break
             else:
-                # El bucle for terminó sin break → trayectoria completada
                 self.get_logger().info(f'  ✓ T{traj_idx} completada.')
 
-        if not self._stop_event.is_set():
+        if set_aborted or self._stop_event.is_set():
+            self.get_logger().warn(f'⚠ Set {set_id} no completado (abortado o interrumpido).')
+        else:
             self.get_logger().info(f'✅ Set {set_id} completado.')
 
         self._running = False
 
     # =========================================================================
-    # CARGA DE CSV DE POSICIONES DESEADAS  (T{n}.csv)
+    # CARGA DE CSVs
     # =========================================================================
     def _load_positions(self, filepath: str) -> list[tuple[float, float]]:
-        """
-        Lee el CSV de posiciones deseadas y devuelve lista de (q1, q2)
-        ordenada por columna 'iteracion'.
-
-        Formato esperado:
-            iteracion,q1,q2
-            1,0.0,0.0
-            2,0.01,0.02
-            ...
-        """
         positions = []
-
         with open(filepath, newline='', encoding='utf-8') as csvfile:
             reader = csv.DictReader(csvfile)
-
             required_cols = {'iteracion', 'q1', 'q2'}
             if not required_cols.issubset(set(reader.fieldnames or [])):
                 raise ValueError(
                     f'Columnas requeridas {required_cols} no encontradas en '
                     f'{filepath}. Columnas presentes: {reader.fieldnames}'
                 )
-
             rows = sorted(reader, key=lambda r: int(r['iteracion']))
-
             for row in rows:
                 positions.append((float(row['q1']), float(row['q2'])))
-
         return positions
 
-    # =========================================================================
-    # CARGA DE CSV DE VELOCIDADES FEEDFORWARD  (T{n}_p.csv)
-    # =========================================================================
     def _load_velocities(self, filepath: str) -> list[tuple[float, float]]:
-        """
-        Lee el CSV de velocidades feedforward y devuelve lista de (q1_p, q2_p)
-        ordenada por columna 'iteracion'.
-
-        Formato esperado:
-            iteracion,q1_p,q2_p
-            1,0,0
-            2,0,-0.062832
-            ...
-        """
         velocities = []
-
         with open(filepath, newline='', encoding='utf-8') as csvfile:
             reader = csv.DictReader(csvfile)
-
             required_cols = {'iteracion', 'q1_p', 'q2_p'}
             if not required_cols.issubset(set(reader.fieldnames or [])):
                 raise ValueError(
                     f'Columnas requeridas {required_cols} no encontradas en '
                     f'{filepath}. Columnas presentes: {reader.fieldnames}'
                 )
-
             rows = sorted(reader, key=lambda r: int(r['iteracion']))
-
             for row in rows:
                 velocities.append((float(row['q1_p']), float(row['q2_p'])))
-
         return velocities
 
 
@@ -404,8 +405,9 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        # Detener cualquier trayectoria en ejecución antes de salir
         node._stop_event.set()
+        node._idle_timer.cancel()
+        node._publish_stop()
         if node._exec_thread is not None:
             node._exec_thread.join(timeout=2.0)
         node.destroy_node()
